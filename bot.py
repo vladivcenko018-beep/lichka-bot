@@ -8,7 +8,18 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from config import BOT_TOKEN, GROUP_ID, ADMIN_IDS
+import os
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+GROUP_ID = int(os.environ.get("GROUP_ID", 0))
+ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x]
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN not set in environment variables")
+if GROUP_ID == 0:
+    raise ValueError("GROUP_ID not set in environment variables")
+if not ADMIN_IDS:
+    raise ValueError("ADMIN_IDS not set in environment variables")
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()

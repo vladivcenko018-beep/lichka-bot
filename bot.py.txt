@@ -34,7 +34,6 @@ def init_db():
         key TEXT PRIMARY KEY,
         value TEXT
     )""")
-    # Настройки по умолчанию
     c.execute("INSERT OR IGNORE INTO settings VALUES ('max_before_12', '3')")
     c.execute("INSERT OR IGNORE INTO settings VALUES ('max_after_12', '2')")
     c.execute("INSERT OR IGNORE INTO settings VALUES ('forbidden_windows', '09:00-10:00,11:00-12:00,20:45-22:00')")
@@ -69,7 +68,6 @@ def get_forbidden_windows() -> List[Tuple[str, str]]:
     return windows
 
 def is_forbidden_now() -> bool:
-    """Проверка, можно ли сейчас уйти на личку"""
     now = datetime.now().strftime("%H:%M")
     for start, end in get_forbidden_windows():
         if start <= now <= end:
@@ -85,7 +83,6 @@ def get_max_concurrent() -> int:
 
 # ---------- Работа с пользователями ----------
 def reset_daily_minutes():
-    """Сброс минут в 00:00"""
     conn = sqlite3.connect("breaks.db")
     c = conn.cursor()
     today_str = datetime.now().date().isoformat()
@@ -102,7 +99,6 @@ def get_user_today_minutes(user_id: int) -> int:
     if not row:
         conn.close()
         return 0
-    # Если прошлый день — обнуляем
     if row[1] != today_str:
         c.execute("UPDATE users SET today_minutes = 0, last_break_date = ? WHERE user_id = ?", (today_str, user_id))
         conn.commit()
@@ -154,7 +150,7 @@ def end_break(user_id: int) -> int:
         return 0
     start = datetime.fromisoformat(row[0])
     duration = int((datetime.now() - start).total_seconds() / 60)
-    duration = min(duration, 15)  # макс 15 минут
+    duration = min(duration, 15)
     c.execute("DELETE FROM active_breaks WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
@@ -163,29 +159,21 @@ def end_break(user_id: int) -> int:
 
 # ---------- Проверка на нарушение ----------
 def check_and_punish(user_id: int, username: str) -> bool:
-    """
-    Проверяет, нарушил ли пользователь правила.
-    Возвращает True, если штраф отправлен
-    """
     reason = None
     
-    # 1. Проверка закрытых окон
     if is_forbidden_now():
         reason = "попытка уйти в закрытое окно"
     
-    # 2. Проверка лимита на человека (60 мин в день)
     used_today = get_user_today_minutes(user_id)
     if used_today >= 60:
         reason = f"превышение дневного лимита (60 мин), использовано {used_today} мин"
     
-    # 3. Проверка одновременных
     active = get_active_breaks()
     max_concurrent = get_max_concurrent()
     if len(active) >= max_concurrent:
         reason = f"превышение одновременных ({len(active)} > {max_concurrent})"
     
     if reason:
-        # Отправляем штраф в группу
         full_username = f"@{username}" if username else f"id{user_id}"
         message = f"🚨 {full_username} нарушил правила личного перерыва — 300 грн штраф\n📌 Причина: {reason}"
         asyncio.create_task(bot.send_message(GROUP_ID, message))
@@ -196,14 +184,12 @@ def check_and_punish(user_id: int, username: str) -> bool:
 def get_status_text() -> str:
     active = get_active_breaks()
     max_concurrent = get_max_concurrent()
-    used_today_total = 0
     conn = sqlite3.connect("breaks.db")
     c = conn.cursor()
     c.execute("SELECT SUM(today_minutes) FROM users WHERE last_break_date = ?", (datetime.now().date().isoformat(),))
     total = c.fetchone()[0] or 0
     conn.close()
     
-    now = datetime.now()
     forbidden_now = is_forbidden_now()
     
     text = f"""
@@ -219,12 +205,12 @@ def get_status_text() -> str:
 
 ⏰ Сейчас на личке: {len(active)}/{max_concurrent}
 🎟 Свободных мест: {max_concurrent - len(active)}
-📊 Команда использовала сегодня: {total} / ???
+📊 Команда использовала сегодня: {total} мин
 
 🆔 Активные:
 {chr(10).join([f"• @{a['username'] or str(a['user_id'])}" for a in active]) or "никого"}
 
-{ '🔴 СЕЙЧАС ЛИЧКА ЗАКРЫТА' if forbidden_now else '🟢 Личка открыта' }
+{'🔴 СЕЙЧАС ЛИЧКА ЗАКРЫТА' if forbidden_now else '🟢 Личка открыта'}
     """
     return text.strip()
 
@@ -249,45 +235,40 @@ async def cmd_start(message: types.Message):
 @dp.callback_query(lambda c: c.data == "start_break")
 async def start_break_callback(callback: types.CallbackQuery):
     user = callback.from_user
-    
-    # Обновляем инфу
     update_user_info(user.id, user.username or "", user.full_name)
     
-    # Проверка на штраф
     if check_and_punish(user.id, user.username):
         await callback.answer("❌ Нарушение! Штраф 300 грн отправлен в группу", show_alert=True)
         await callback.message.edit_text(get_status_text(), reply_markup=get_keyboard(), parse_mode="Markdown")
         return
     
-    # Проверка: уже на личке?
     active = get_active_breaks()
     if any(b["user_id"] == user.id for b in active):
         await callback.answer("❌ Ты уже на личке", show_alert=True)
         return
     
-    # Проверка: свободные места
     max_concurrent = get_max_concurrent()
     if len(active) >= max_concurrent:
         await callback.answer(f"❌ Нет свободных мест (макс {max_concurrent})", show_alert=True)
         return
     
-    # Проверка: дневной лимит
     used = get_user_today_minutes(user.id)
     if used >= 60:
         await callback.answer(f"❌ Твой лимит 60 минут на сегодня, использовано {used}", show_alert=True)
         return
     
-    # Запуск перерыва
+    if is_forbidden_now():
+        await callback.answer("❌ Сейчас личка закрыта (запрещённое время)", show_alert=True)
+        return
+    
     start_break(user.id, user.username)
     await callback.answer("✅ Ты ушёл на личку! Не забудь вернуться через 15 мин", show_alert=True)
     await callback.message.edit_text(get_status_text(), reply_markup=get_keyboard(), parse_mode="Markdown")
     
-    # Автоматический возврат через 15 минут
     async def auto_return():
         await asyncio.sleep(15 * 60)
         end_break(user.id)
         await bot.send_message(user.id, "⏰ Твои 15 минут на личке закончились. Ты автоматически возвращён.")
-        # Обновляем статус в последнем сообщении
         await callback.message.edit_text(get_status_text(), reply_markup=get_keyboard(), parse_mode="Markdown")
     
     asyncio.create_task(auto_return())
@@ -336,7 +317,7 @@ async def add_forbidden(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         return
     try:
-        window = message.text.split()[1]  # формат 13:00-14:00
+        window = message.text.split()[1]
         current = get_setting("forbidden_windows")
         new_windows = current + f",{window}"
         set_setting("forbidden_windows", new_windows)
@@ -392,19 +373,3 @@ async def stats(message: types.Message):
     for username, minutes in rows:
         text += f"• @{username or 'без username'} — {minutes}/60 мин\n"
     await message.answer(text, parse_mode="Markdown")
-
-# ---------- Запуск ----------
-async def main():
-    # Ежедневный сброс в 00:00
-    async def daily_reset():
-        while True:
-            now = datetime.now()
-            next_reset = now.replace(hour=0, minute=0, second=0) + timedelta(days=1)
-            await asyncio.sleep((next_reset - now).total_seconds())
-            reset_daily_minutes()
-    
-    asyncio.create_task(daily_reset())
-    await dp.start_polling(bot)
-
-if name == "main":
-    asyncio.run(main())

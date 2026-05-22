@@ -4,7 +4,7 @@ import threading
 from flask import Flask
 from bot import dp, bot as telegram_bot
 
-app = Flask(name)
+app = Flask(__name__)
 
 @app.route('/')
 def home():

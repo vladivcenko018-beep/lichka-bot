@@ -16,11 +16,11 @@ GROUP_ID = int(os.environ.get("GROUP_ID", 0))
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x]
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN not set in environment variables")
+    raise ValueError("BOT_TOKEN not set")
 if GROUP_ID == 0:
-    raise ValueError("GROUP_ID not set in environment variables")
+    raise ValueError("GROUP_ID not set")
 if not ADMIN_IDS:
-    raise ValueError("ADMIN_IDS not set in environment variables")
+    raise ValueError("ADMIN_IDS not set")
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
@@ -30,7 +30,8 @@ dp = Dispatcher(storage=storage)
 KIEV_TZ = pytz.timezone('Europe/Kiev')
 
 def now_kiev() -> datetime:
-    return datetime.now(KIEV_TZ)
+    """Возвращает текущее киевское время без часового пояса (naive)"""
+    return datetime.now(KIEV_TZ).replace(tzinfo=None)
 
 # ---------- БД ----------
 def init_db():
@@ -61,7 +62,7 @@ def init_db():
 
 init_db()
 
-# ---------- Работа с настройками ----------
+# ---------- Настройки ----------
 def get_setting(key: str) -> str:
     conn = sqlite3.connect("breaks.db")
     c = conn.cursor()
@@ -100,7 +101,7 @@ def get_max_concurrent() -> int:
     else:
         return int(get_setting("max_after_12"))
 
-# ---------- Работа с пользователями ----------
+# ---------- Пользователи ----------
 def reset_daily_minutes():
     conn = sqlite3.connect("breaks.db")
     c = conn.cursor()
@@ -149,7 +150,17 @@ def get_active_breaks() -> List[dict]:
     c.execute("SELECT user_id, start_time, username, full_name FROM active_breaks")
     rows = c.fetchall()
     conn.close()
-    return [{"user_id": r[0], "start": datetime.fromisoformat(r[1]), "username": r[2], "full_name": r[3]} for r in rows]
+    result = []
+    for r in rows:
+        # start_time сохранён как naive, просто преобразуем
+        start = datetime.fromisoformat(r[1])
+        result.append({
+            "user_id": r[0],
+            "start": start,
+            "username": r[2],
+            "full_name": r[3]
+        })
+    return result
 
 def start_break(user_id: int, username: str, full_name: str):
     conn = sqlite3.connect("breaks.db")
@@ -184,7 +195,7 @@ def get_user_display_name(user_id: int, username: str, full_name: str) -> str:
     else:
         return str(user_id)
 
-# ---------- Статус ----------
+# ---------- Текст статуса и клавиатура ----------
 def get_status_text() -> str:
     active = get_active_breaks()
     max_concurrent = get_max_concurrent()
@@ -306,7 +317,7 @@ async def end_break_callback(callback: types.CallbackQuery):
         await callback.answer(f"✅ Ты вернулся с лички (был {duration} мин)", show_alert=True)
     await safe_edit_message(callback.message, get_status_text(), get_keyboard(), "Markdown")
 
-# ---------- Админ-команды (оставляем как есть) ----------
+# ---------- Админ-команды ----------
 @dp.message(Command("set_max_before_12"))
 async def set_max_before_12(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:

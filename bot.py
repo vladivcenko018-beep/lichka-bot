@@ -422,5 +422,9 @@ async def stats(message: types.Message):
 
 # ---------- Запуск бота (вызывается из app.py) ----------
 async def start_bot():
+    # Очищаем старые webhook и конфликты
+    await bot.delete_webhook(drop_pending_updates=True)
+    # Запускаем автообновление
     asyncio.create_task(auto_updater())
-    await dp.start_polling(bot, handle_signals=False)   # <--- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ
+    # Запускаем поллинг с отключением обработки сигналов (чтобы не было ошибки с сигналами)
+    await dp.start_polling(bot, handle_signals=False)

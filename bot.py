@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 from datetime import datetime, timedelta
 from typing import List, Tuple
+import pytz
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -25,6 +26,13 @@ bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
+# Часовой пояс Киева (UTC+3)
+KIEV_TZ = pytz.timezone('Europe/Kiev')
+
+def now_kiev() -> datetime:
+    """Возвращает текущее время в Киеве"""
+    return datetime.now(KIEV_TZ)
+
 # ---------- БД ----------
 def init_db():
     conn = sqlite3.connect("breaks.db")
@@ -39,7 +47,8 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS active_breaks (
         user_id INTEGER PRIMARY KEY,
         start_time TEXT,
-        username TEXT
+        username TEXT,
+        full_name TEXT
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -47,7 +56,7 @@ def init_db():
     )""")
     c.execute("INSERT OR IGNORE INTO settings VALUES ('max_before_12', '3')")
     c.execute("INSERT OR IGNORE INTO settings VALUES ('max_after_12', '2')")
-    c.execute("INSERT OR IGNORE INTO settings VALUES ('forbidden_windows', '09:00-10:00,11:00-12:00,20:45-22:00')")
+    c.execute("INSERT OR IGNORE INTO settings VALUES ('forbidden_windows', '09:00-10:00,10:45-12:00,17:00-18:00,20:45-22:00')")
     conn.commit()
     conn.close()
 
@@ -79,14 +88,14 @@ def get_forbidden_windows() -> List[Tuple[str, str]]:
     return windows
 
 def is_forbidden_now() -> bool:
-    now = datetime.now().strftime("%H:%M")
+    now = now_kiev().strftime("%H:%M")
     for start, end in get_forbidden_windows():
         if start <= now <= end:
             return True
     return False
 
 def get_max_concurrent() -> int:
-    now = datetime.now()
+    now = now_kiev()
     if now.hour < 12:
         return int(get_setting("max_before_12"))
     else:
@@ -96,7 +105,7 @@ def get_max_concurrent() -> int:
 def reset_daily_minutes():
     conn = sqlite3.connect("breaks.db")
     c = conn.cursor()
-    today_str = datetime.now().date().isoformat()
+    today_str = now_kiev().date().isoformat()
     c.execute("UPDATE users SET today_minutes = 0, last_break_date = ?", (today_str,))
     conn.commit()
     conn.close()
@@ -104,7 +113,7 @@ def reset_daily_minutes():
 def get_user_today_minutes(user_id: int) -> int:
     conn = sqlite3.connect("breaks.db")
     c = conn.cursor()
-    today_str = datetime.now().date().isoformat()
+    today_str = now_kiev().date().isoformat()
     c.execute("SELECT today_minutes, last_break_date FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
     if not row:
@@ -121,7 +130,7 @@ def get_user_today_minutes(user_id: int) -> int:
 def add_user_minutes(user_id: int, minutes: int):
     conn = sqlite3.connect("breaks.db")
     c = conn.cursor()
-    today_str = datetime.now().date().isoformat()
+    today_str = now_kiev().date().isoformat()
     c.execute("INSERT OR IGNORE INTO users (user_id, today_minutes, last_break_date) VALUES (?, 0, ?)", (user_id, today_str))
     c.execute("UPDATE users SET today_minutes = today_minutes + ? WHERE user_id = ?", (minutes, user_id))
     conn.commit()
@@ -138,16 +147,16 @@ def update_user_info(user_id: int, username: str, full_name: str):
 def get_active_breaks() -> List[dict]:
     conn = sqlite3.connect("breaks.db")
     c = conn.cursor()
-    c.execute("SELECT user_id, start_time, username FROM active_breaks")
+    c.execute("SELECT user_id, start_time, username, full_name FROM active_breaks")
     rows = c.fetchall()
     conn.close()
-    return [{"user_id": r[0], "start": datetime.fromisoformat(r[1]), "username": r[2]} for r in rows]
+    return [{"user_id": r[0], "start": datetime.fromisoformat(r[1]), "username": r[2], "full_name": r[3]} for r in rows]
 
-def start_break(user_id: int, username: str):
+def start_break(user_id: int, username: str, full_name: str):
     conn = sqlite3.connect("breaks.db")
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
-    c.execute("INSERT INTO active_breaks VALUES (?, ?, ?)", (user_id, datetime.now().isoformat(), username))
+    c.execute("INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?, ?, ?)", (user_id, username, full_name))
+    c.execute("INSERT INTO active_breaks VALUES (?, ?, ?, ?)", (user_id, now_kiev().isoformat(), username, full_name))
     conn.commit()
     conn.close()
 
@@ -160,7 +169,7 @@ def end_break(user_id: int) -> int:
         conn.close()
         return 0
     start = datetime.fromisoformat(row[0])
-    duration = int((datetime.now() - start).total_seconds() / 60)
+    duration = int((now_kiev() - start).total_seconds() / 60)
     duration = min(duration, 15)
     c.execute("DELETE FROM active_breaks WHERE user_id = ?", (user_id,))
     conn.commit()
@@ -168,40 +177,32 @@ def end_break(user_id: int) -> int:
     add_user_minutes(user_id, duration)
     return duration
 
-# ---------- Проверка на нарушение ----------
-def check_and_punish(user_id: int, username: str) -> bool:
-    reason = None
-    
-    if is_forbidden_now():
-        reason = "попытка уйти в закрытое окно"
-    
-    used_today = get_user_today_minutes(user_id)
-    if used_today >= 60:
-        reason = f"превышение дневного лимита (60 мин), использовано {used_today} мин"
-    
-    active = get_active_breaks()
-    max_concurrent = get_max_concurrent()
-    if len(active) >= max_concurrent:
-        reason = f"превышение одновременных ({len(active)} > {max_concurrent})"
-    
-    if reason:
-        full_username = f"@{username}" if username else f"id{user_id}"
-        message = f"🚨 {full_username} нарушил правила личного перерыва — 300 грн штраф\n📌 Причина: {reason}"
-        asyncio.create_task(bot.send_message(GROUP_ID, message))
-        return True
-    return False
+def get_user_display_name(user_id: int, username: str, full_name: str) -> str:
+    """Возвращает username или полное имя, если нет username"""
+    if username:
+        return f"@{username}"
+    elif full_name:
+        return full_name
+    else:
+        return str(user_id)
 
-# ---------- Статус ----------
+# ---------- Статус (текст + клавиатура без кнопки Статус) ----------
 def get_status_text() -> str:
     active = get_active_breaks()
     max_concurrent = get_max_concurrent()
     conn = sqlite3.connect("breaks.db")
     c = conn.cursor()
-    c.execute("SELECT SUM(today_minutes) FROM users WHERE last_break_date = ?", (datetime.now().date().isoformat(),))
+    c.execute("SELECT SUM(today_minutes) FROM users WHERE last_break_date = ?", (now_kiev().date().isoformat(),))
     total = c.fetchone()[0] or 0
     conn.close()
     
     forbidden_now = is_forbidden_now()
+    
+    # Список активных с отображением имени
+    active_list = []
+    for a in active:
+        display = get_user_display_name(a['user_id'], a['username'], a['full_name'])
+        active_list.append(f"• {display}")
     
     text = f"""
 🐯 *Контроль личного перерыва*  
@@ -212,25 +213,36 @@ def get_status_text() -> str:
 • 15 минут за раз
 • Одновременно: до 12:00 — {get_setting('max_before_12')}, после 12:00 — {get_setting('max_after_12')}
 
-🚫 *Личка закрыта:* 09:00-10:00, 11:00-12:00, 20:45-22:00
+🚫 *Личка закрыта:* 09:00-10:00, 10:45-12:00, 17:00-18:00, 20:45-22:00
 
 ⏰ Сейчас на личке: {len(active)}/{max_concurrent}
 🎟 Свободных мест: {max_concurrent - len(active)}
 📊 Команда использовала сегодня: {total} мин
 
 🆔 Активные:
-{chr(10).join([f"• @{a['username'] or str(a['user_id'])}" for a in active]) or "никого"}
+{chr(10).join(active_list) if active_list else "никого"}
 
 {'🔴 СЕЙЧАС ЛИЧКА ЗАКРЫТА' if forbidden_now else '🟢 Личка открыта'}
     """
     return text.strip()
 
 def get_keyboard():
+    # Убрали кнопку "Статус"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚶 Уйти на личку", callback_data="start_break")],
-        [InlineKeyboardButton(text="✅ Вернулся", callback_data="end_break")],
-        [InlineKeyboardButton(text="📊 Статус", callback_data="status")]
+        [InlineKeyboardButton(text="✅ Вернулся", callback_data="end_break")]
     ])
+
+# ---------- Вспомогательная функция обновления сообщения (без ошибки) ----------
+async def safe_edit_message(message, text, reply_markup, parse_mode="Markdown"):
+    """Редактирует сообщение, только если текст изменился"""
+    if message.text != text:
+        try:
+            await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        except Exception as e:
+            # Если ошибка "message is not modified" - игнорируем
+            if "message is not modified" not in str(e):
+                raise e
 
 # ---------- Обработчики команд ----------
 @dp.message(Command("start"))
@@ -246,13 +258,9 @@ async def cmd_start(message: types.Message):
 @dp.callback_query(lambda c: c.data == "start_break")
 async def start_break_callback(callback: types.CallbackQuery):
     user = callback.from_user
-    update_user_info(user.id, user.username or "", user.full_name)
+    update_user_info(user.id, user.username or "", user.full_name or user.first_name)
     
-    if check_and_punish(user.id, user.username):
-        await callback.answer("❌ Нарушение! Штраф 300 грн отправлен в группу", show_alert=True)
-        await callback.message.edit_text(get_status_text(), reply_markup=get_keyboard(), parse_mode="Markdown")
-        return
-    
+    # Проверки без штрафа
     active = get_active_breaks()
     if any(b["user_id"] == user.id for b in active):
         await callback.answer("❌ Ты уже на личке", show_alert=True)
@@ -272,15 +280,29 @@ async def start_break_callback(callback: types.CallbackQuery):
         await callback.answer("❌ Сейчас личка закрыта (запрещённое время)", show_alert=True)
         return
     
-    start_break(user.id, user.username)
+    # Запуск перерыва
+    start_break(user.id, user.username or "", user.full_name or user.first_name)
     await callback.answer("✅ Ты ушёл на личку! Не забудь вернуться через 15 мин", show_alert=True)
-    await callback.message.edit_text(get_status_text(), reply_markup=get_keyboard(), parse_mode="Markdown")
+    await safe_edit_message(callback.message, get_status_text(), get_keyboard(), "Markdown")
     
+    # Автоматическое завершение через 15 минут
     async def auto_return():
         await asyncio.sleep(15 * 60)
-        end_break(user.id)
-        await bot.send_message(user.id, "⏰ Твои 15 минут на личке закончились. Ты автоматически возвращён.")
-        await callback.message.edit_text(get_status_text(), reply_markup=get_keyboard(), parse_mode="Markdown")
+        # Проверяем, не вернулся ли уже
+        active_after = get_active_breaks()
+        if any(b["user_id"] == user.id for b in active_after):
+            end_break(user.id)
+            # Отправляем сообщение в группу с предложением проверить штраф
+            display_name = get_user_display_name(user.id, user.username or "", user.full_name or user.first_name)
+            await bot.send_message(
+                GROUP_ID,
+                f"⏰ {display_name} пробыл на личке 15 минут. Проверить, возможно стоит поставить штраф."
+            )
+            # Обновляем сообщение бота (если оно ещё существует)
+            try:
+                await safe_edit_message(callback.message, get_status_text(), get_keyboard(), "Markdown")
+            except:
+                pass
     
     asyncio.create_task(auto_return())
 
@@ -293,12 +315,7 @@ async def end_break_callback(callback: types.CallbackQuery):
     else:
         duration = end_break(user.id)
         await callback.answer(f"✅ Ты вернулся с лички (был {duration} мин)", show_alert=True)
-    await callback.message.edit_text(get_status_text(), reply_markup=get_keyboard(), parse_mode="Markdown")
-
-@dp.callback_query(lambda c: c.data == "status")
-async def status_callback(callback: types.CallbackQuery):
-    await callback.message.edit_text(get_status_text(), reply_markup=get_keyboard(), parse_mode="Markdown")
-    await callback.answer()
+    await safe_edit_message(callback.message, get_status_text(), get_keyboard(), "Markdown")
 
 # ---------- Админ-команды ----------
 @dp.message(Command("set_max_before_12"))
@@ -371,8 +388,8 @@ async def stats(message: types.Message):
         return
     conn = sqlite3.connect("breaks.db")
     c = conn.cursor()
-    today = datetime.now().date().isoformat()
-    c.execute("SELECT username, today_minutes FROM users WHERE last_break_date = ? ORDER BY today_minutes DESC", (today,))
+    today = now_kiev().date().isoformat()
+    c.execute("SELECT username, full_name, today_minutes FROM users WHERE last_break_date = ? ORDER BY today_minutes DESC", (today,))
     rows = c.fetchall()
     conn.close()
     
@@ -381,6 +398,10 @@ async def stats(message: types.Message):
         return
     
     text = "📊 *Статистика за сегодня:*\n"
-    for username, minutes in rows:
-        text += f"• @{username or 'без username'} — {minutes}/60 мин\n"
+    for username, full_name, minutes in rows:
+        display = username if username else (full_name if full_name else "Без имени")
+        text += f"• {display} — {minutes}/60 мин\n"
     await message.answer(text, parse_mode="Markdown")
+
+# ---------- Удаляем функцию check_and_punish, она больше не нужна ----------
+# (оставлен только код выше)

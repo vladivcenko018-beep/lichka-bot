@@ -1,7 +1,7 @@
 import asyncio
 import sqlite3
 from datetime import datetime, timedelta
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 import pytz
 
 from aiogram import Bot, Dispatcher, types
@@ -26,12 +26,12 @@ bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# Часовой пояс Киева (UTC+3)
 KIEV_TZ = pytz.timezone('Europe/Kiev')
-
 def now_kiev() -> datetime:
-    """Возвращает текущее киевское время без часового пояса (naive)"""
     return datetime.now(KIEV_TZ).replace(tzinfo=None)
+
+# Хранилище ID последнего сообщения бота для каждого чата
+last_bot_message_id: Dict[int, int] = {}
 
 # ---------- БД ----------
 def init_db():
@@ -152,11 +152,9 @@ def get_active_breaks() -> List[dict]:
     conn.close()
     result = []
     for r in rows:
-        # start_time сохранён как naive, просто преобразуем
-        start = datetime.fromisoformat(r[1])
         result.append({
             "user_id": r[0],
-            "start": start,
+            "start": datetime.fromisoformat(r[1]),
             "username": r[2],
             "full_name": r[3]
         })
@@ -195,7 +193,7 @@ def get_user_display_name(user_id: int, username: str, full_name: str) -> str:
     else:
         return str(user_id)
 
-# ---------- Текст статуса и клавиатура ----------
+# ---------- Текст и клавиатура ----------
 def get_status_text() -> str:
     active = get_active_breaks()
     max_concurrent = get_max_concurrent()
@@ -204,16 +202,16 @@ def get_status_text() -> str:
     c.execute("SELECT SUM(today_minutes) FROM users WHERE last_break_date = ?", (now_kiev().date().isoformat(),))
     total = c.fetchone()[0] or 0
     conn.close()
-    
+
     forbidden_now = is_forbidden_now()
     now = now_kiev()
-    
+
     active_list = []
     for a in active:
         display = get_user_display_name(a['user_id'], a['username'], a['full_name'])
         elapsed = int((now - a['start']).total_seconds() / 60)
         active_list.append(f"• {display} — {elapsed} мин")
-    
+
     text = f"""
 🐯 *Контроль личного перерыва*  
 👥 Команда онлайн-продаж БАД
@@ -242,82 +240,98 @@ def get_keyboard():
         [InlineKeyboardButton(text="✅ Вернулся", callback_data="end_break")]
     ])
 
-async def safe_edit_message(message, text, reply_markup, parse_mode="Markdown"):
-    if message.text != text:
-        try:
-            await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-        except Exception as e:
-            if "message is not modified" not in str(e):
-                raise e
+# ---------- Функция обновления (отправка/редактирование) ----------
+async def update_control_message(chat_id: int):
+    text = get_status_text()
+    markup = get_keyboard()
+    last_id = last_bot_message_id.get(chat_id)
+    try:
+        if last_id:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=last_id,
+                                        reply_markup=markup, parse_mode="Markdown")
+        else:
+            msg = await bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+            last_bot_message_id[chat_id] = msg.message_id
+    except Exception as e:
+        if "message to edit not found" in str(e):
+            msg = await bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+            last_bot_message_id[chat_id] = msg.message_id
+        elif "message is not modified" in str(e):
+            pass
+        else:
+            raise
 
-# ---------- Обработчики ----------
+# ---------- Автообновление каждую минуту ----------
+async def auto_updater():
+    while True:
+        await asyncio.sleep(60)
+        if GROUP_ID:
+            await update_control_message(GROUP_ID)
+        for admin_id in ADMIN_IDS:
+            await update_control_message(admin_id)
+
+# ---------- Обработчики команд ----------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer(
-        "🐯 *Бот контроля личного перерыва*\n\n"
-        "Используй кнопки, чтобы уйти на личку или вернуться.\n\n"
-        f"{get_status_text()}",
-        reply_markup=get_keyboard(),
-        parse_mode="Markdown"
-    )
+    await update_control_message(message.chat.id)
 
 @dp.callback_query(lambda c: c.data == "start_break")
 async def start_break_callback(callback: types.CallbackQuery):
     user = callback.from_user
     update_user_info(user.id, user.username or "", user.full_name or user.first_name)
-    
+    chat_id = callback.message.chat.id
+
     active = get_active_breaks()
     if any(b["user_id"] == user.id for b in active):
         await callback.answer("❌ Ты уже на личке", show_alert=True)
+        await update_control_message(chat_id)
         return
-    
+
     max_concurrent = get_max_concurrent()
     if len(active) >= max_concurrent:
         await callback.answer(f"❌ Нет свободных мест (макс {max_concurrent})", show_alert=True)
+        await update_control_message(chat_id)
         return
-    
+
     used = get_user_today_minutes(user.id)
     if used >= 60:
         await callback.answer(f"❌ Твой лимит 60 минут на сегодня, использовано {used}", show_alert=True)
+        await update_control_message(chat_id)
         return
-    
+
     if is_forbidden_now():
         await callback.answer("❌ Сейчас личка закрыта (запрещённое время)", show_alert=True)
+        await update_control_message(chat_id)
         return
-    
+
     start_break(user.id, user.username or "", user.full_name or user.first_name)
     await callback.answer("✅ Ты ушёл на личку! Не забудь вернуться через 15 мин", show_alert=True)
-    await safe_edit_message(callback.message, get_status_text(), get_keyboard(), "Markdown")
-    
+    await update_control_message(chat_id)
+
+    # Автоматический возврат через 15 минут
     async def auto_return():
         await asyncio.sleep(15 * 60)
         active_after = get_active_breaks()
         if any(b["user_id"] == user.id for b in active_after):
             end_break(user.id)
             display_name = get_user_display_name(user.id, user.username or "", user.full_name or user.first_name)
-            await bot.send_message(
-                GROUP_ID,
-                f"⏰ {display_name} пробыл на личке 15 минут. Проверить, возможно стоит поставить штраф."
-            )
-            try:
-                await safe_edit_message(callback.message, get_status_text(), get_keyboard(), "Markdown")
-            except:
-                pass
-    
+            await bot.send_message(GROUP_ID, f"⏰ {display_name} пробыл на личке 15 минут. Проверить, возможно стоит поставить штраф.")
+            await update_control_message(chat_id)
     asyncio.create_task(auto_return())
 
 @dp.callback_query(lambda c: c.data == "end_break")
 async def end_break_callback(callback: types.CallbackQuery):
     user = callback.from_user
+    chat_id = callback.message.chat.id
     active = get_active_breaks()
     if not any(b["user_id"] == user.id for b in active):
         await callback.answer("❌ Ты не на личке", show_alert=True)
     else:
         duration = end_break(user.id)
         await callback.answer(f"✅ Ты вернулся с лички (был {duration} мин)", show_alert=True)
-    await safe_edit_message(callback.message, get_status_text(), get_keyboard(), "Markdown")
+    await update_control_message(chat_id)
 
-# ---------- Админ-команды ----------
+# ---------- Админ-команды (оставляем короткие) ----------
 @dp.message(Command("set_max_before_12"))
 async def set_max_before_12(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -326,6 +340,7 @@ async def set_max_before_12(message: types.Message):
         val = int(message.text.split()[1])
         set_setting("max_before_12", str(val))
         await message.answer(f"✅ До 12:00 максимум {val} человек")
+        await update_control_message(message.chat.id)
     except:
         await message.answer("❌ Используй: /set_max_before_12 3")
 
@@ -337,6 +352,7 @@ async def set_max_after_12(message: types.Message):
         val = int(message.text.split()[1])
         set_setting("max_after_12", str(val))
         await message.answer(f"✅ После 12:00 максимум {val} человек")
+        await update_control_message(message.chat.id)
     except:
         await message.answer("❌ Используй: /set_max_after_12 2")
 
@@ -350,6 +366,7 @@ async def add_forbidden(message: types.Message):
         new_windows = current + f",{window}"
         set_setting("forbidden_windows", new_windows)
         await message.answer(f"✅ Добавлено закрытое окно: {window}")
+        await update_control_message(message.chat.id)
     except:
         await message.answer("❌ Используй: /add_forbidden 13:00-14:00")
 
@@ -364,6 +381,7 @@ async def remove_forbidden(message: types.Message):
         windows = [w.strip() for w in windows if w.strip() != window]
         set_setting("forbidden_windows", ",".join(windows))
         await message.answer(f"✅ Удалено закрытое окно: {window}")
+        await update_control_message(message.chat.id)
     except:
         await message.answer("❌ Используй: /remove_forbidden 13:00-14:00")
 
@@ -379,6 +397,7 @@ async def reset_user(message: types.Message):
         conn.commit()
         conn.close()
         await message.answer(f"✅ Сброшены минуты для @{username}")
+        await update_control_message(message.chat.id)
     except:
         await message.answer("❌ Используй: /reset_user @username")
 
@@ -392,13 +411,16 @@ async def stats(message: types.Message):
     c.execute("SELECT username, full_name, today_minutes FROM users WHERE last_break_date = ? ORDER BY today_minutes DESC", (today,))
     rows = c.fetchall()
     conn.close()
-    
     if not rows:
         await message.answer("📊 Сегодня никто не уходил на личку")
         return
-    
     text = "📊 *Статистика за сегодня:*\n"
     for username, full_name, minutes in rows:
         display = username if username else (full_name if full_name else "Без имени")
         text += f"• {display} — {minutes}/60 мин\n"
     await message.answer(text, parse_mode="Markdown")
+
+# ---------- Запуск бота (для внешнего вызова) ----------
+async def start_bot():
+    asyncio.create_task(auto_updater())
+    await dp.start_polling(bot)

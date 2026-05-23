@@ -30,7 +30,6 @@ dp = Dispatcher(storage=storage)
 KIEV_TZ = pytz.timezone('Europe/Kiev')
 
 def now_kiev() -> datetime:
-    """Возвращает текущее время в Киеве"""
     return datetime.now(KIEV_TZ)
 
 # ---------- БД ----------
@@ -178,7 +177,6 @@ def end_break(user_id: int) -> int:
     return duration
 
 def get_user_display_name(user_id: int, username: str, full_name: str) -> str:
-    """Возвращает username или полное имя, если нет username"""
     if username:
         return f"@{username}"
     elif full_name:
@@ -186,7 +184,7 @@ def get_user_display_name(user_id: int, username: str, full_name: str) -> str:
     else:
         return str(user_id)
 
-# ---------- Статус (текст + клавиатура без кнопки Статус) ----------
+# ---------- Статус ----------
 def get_status_text() -> str:
     active = get_active_breaks()
     max_concurrent = get_max_concurrent()
@@ -197,12 +195,13 @@ def get_status_text() -> str:
     conn.close()
     
     forbidden_now = is_forbidden_now()
+    now = now_kiev()
     
-    # Список активных с отображением имени
     active_list = []
     for a in active:
         display = get_user_display_name(a['user_id'], a['username'], a['full_name'])
-        active_list.append(f"• {display}")
+        elapsed = int((now - a['start']).total_seconds() / 60)
+        active_list.append(f"• {display} — {elapsed} мин")
     
     text = f"""
 🐯 *Контроль личного перерыва*  
@@ -227,24 +226,20 @@ def get_status_text() -> str:
     return text.strip()
 
 def get_keyboard():
-    # Убрали кнопку "Статус"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚶 Уйти на личку", callback_data="start_break")],
         [InlineKeyboardButton(text="✅ Вернулся", callback_data="end_break")]
     ])
 
-# ---------- Вспомогательная функция обновления сообщения (без ошибки) ----------
 async def safe_edit_message(message, text, reply_markup, parse_mode="Markdown"):
-    """Редактирует сообщение, только если текст изменился"""
     if message.text != text:
         try:
             await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
         except Exception as e:
-            # Если ошибка "message is not modified" - игнорируем
             if "message is not modified" not in str(e):
                 raise e
 
-# ---------- Обработчики команд ----------
+# ---------- Обработчики ----------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
@@ -260,7 +255,6 @@ async def start_break_callback(callback: types.CallbackQuery):
     user = callback.from_user
     update_user_info(user.id, user.username or "", user.full_name or user.first_name)
     
-    # Проверки без штрафа
     active = get_active_breaks()
     if any(b["user_id"] == user.id for b in active):
         await callback.answer("❌ Ты уже на личке", show_alert=True)
@@ -280,25 +274,20 @@ async def start_break_callback(callback: types.CallbackQuery):
         await callback.answer("❌ Сейчас личка закрыта (запрещённое время)", show_alert=True)
         return
     
-    # Запуск перерыва
     start_break(user.id, user.username or "", user.full_name or user.first_name)
     await callback.answer("✅ Ты ушёл на личку! Не забудь вернуться через 15 мин", show_alert=True)
     await safe_edit_message(callback.message, get_status_text(), get_keyboard(), "Markdown")
     
-    # Автоматическое завершение через 15 минут
     async def auto_return():
         await asyncio.sleep(15 * 60)
-        # Проверяем, не вернулся ли уже
         active_after = get_active_breaks()
         if any(b["user_id"] == user.id for b in active_after):
             end_break(user.id)
-            # Отправляем сообщение в группу с предложением проверить штраф
             display_name = get_user_display_name(user.id, user.username or "", user.full_name or user.first_name)
             await bot.send_message(
                 GROUP_ID,
                 f"⏰ {display_name} пробыл на личке 15 минут. Проверить, возможно стоит поставить штраф."
             )
-            # Обновляем сообщение бота (если оно ещё существует)
             try:
                 await safe_edit_message(callback.message, get_status_text(), get_keyboard(), "Markdown")
             except:
@@ -317,7 +306,7 @@ async def end_break_callback(callback: types.CallbackQuery):
         await callback.answer(f"✅ Ты вернулся с лички (был {duration} мин)", show_alert=True)
     await safe_edit_message(callback.message, get_status_text(), get_keyboard(), "Markdown")
 
-# ---------- Админ-команды ----------
+# ---------- Админ-команды (оставляем как есть) ----------
 @dp.message(Command("set_max_before_12"))
 async def set_max_before_12(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -402,6 +391,3 @@ async def stats(message: types.Message):
         display = username if username else (full_name if full_name else "Без имени")
         text += f"• {display} — {minutes}/60 мин\n"
     await message.answer(text, parse_mode="Markdown")
-
-# ---------- Удаляем функцию check_and_punish, она больше не нужна ----------
-# (оставлен только код выше)

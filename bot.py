@@ -331,7 +331,7 @@ async def end_break_callback(callback: types.CallbackQuery):
         await callback.answer(f"✅ Ты вернулся с лички (был {duration} мин)", show_alert=True)
     await update_control_message(chat_id)
 
-# ---------- Админ-команды (оставляем короткие) ----------
+# ---------- Админ-команды ----------
 @dp.message(Command("set_max_before_12"))
 async def set_max_before_12(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -420,7 +420,7 @@ async def stats(message: types.Message):
         text += f"• {display} — {minutes}/60 мин\n"
     await message.answer(text, parse_mode="Markdown")
 
-# ---------- Запуск бота (для внешнего вызова) ----------
+# ---------- Запуск бота (вызывается из app.py) ----------
 async def start_bot():
     asyncio.create_task(auto_updater())
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, handle_signals=False)   # <--- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ

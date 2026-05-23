@@ -1,4 +1,3 @@
 aiogram
-apscheduler
-flask
 pytz
+flask

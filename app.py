@@ -18,10 +18,8 @@ def run_flask():
     app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    # Запускаем Flask в отдельном потоке
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.start()
 
-    # Запускаем бота в основном потоке
     from bot import start_bot
     asyncio.run(start_bot())
